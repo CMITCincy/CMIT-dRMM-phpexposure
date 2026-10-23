@@ -32,22 +32,52 @@ function Get-NormalizedPath([string]$Path) {
 
 function Find-PHPFiles {
     param([string[]]$Roots)
-    $found = [Collections.Generic.Dictionary[string,IO.FileInfo]]::new([StringComparer]::OrdinalIgnoreCase)
 
-    $quickPatterns = @(
-        "$env:SystemDrive\PHP\php*.exe",
-        "$env:SystemDrive\xampp\php\php*.exe",
-        "$env:SystemDrive\wamp*\bin\php\*\php*.exe",
-        "$env:SystemDrive\laragon\bin\php\*\php*.exe",
-        "$env:ProgramFiles\PHP\php*.exe",
-        "${env:ProgramFiles(x86)}\PHP\php*.exe"
-    )
-    foreach ($pattern in $quickPatterns) {
-        Get-ChildItem -Path $pattern -File -Force | Where-Object Name -in $targetNames | ForEach-Object {
-            $found[$_.FullName] = $_
-        }
+    # Use a HashSet for de-duplication and emit FileInfo objects directly.
+    # This avoids relying on Dictionary.Values pipeline enumeration.
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $results = [Collections.Generic.List[IO.FileInfo]]::new()
+
+    function Add-PHPFile([string]$Path) {
+        try {
+            if (-not $Path) { return }
+            $leaf = [IO.Path]::GetFileName($Path)
+            if ($targetNames -notcontains $leaf) { return }
+            $full = [IO.Path]::GetFullPath($Path)
+            if ($seen.Add($full)) {
+                $fi = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+                if ($fi -is [IO.FileInfo]) { $results.Add($fi) }
+            }
+        } catch {}
     }
 
+    # Fast checks for normal standalone/dev installs.
+    $quickRoots = @(
+        "$env:SystemDrive\PHP",
+        "$env:SystemDrive\xampp\php",
+        "$env:SystemDrive\laragon\bin\php",
+        "$env:SystemDrive\wamp64\bin\php",
+        "$env:SystemDrive\wamp\bin\php",
+        "$env:ProgramFiles\PHP",
+        "${env:ProgramFiles(x86)}\PHP"
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
+
+    # Explicitly add every local user WinGet package directory. This catches
+    # packages such as PHP.PHP.8.2_Microsoft.Winget.Source_8wekyb3d8bbwe.
+    $userRoots = @(Get-ChildItem -LiteralPath "$env:SystemDrive\Users" -Directory -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName 'AppData\Local\Microsoft\WinGet\Packages' } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+
+    foreach ($scan in @($quickRoots + $userRoots)) {
+        try {
+            Get-ChildItem -LiteralPath $scan -File -Recurse -Force -ErrorAction SilentlyContinue |
+                Where-Object { $targetNames -contains $_.Name } |
+                ForEach-Object { Add-PHPFile $_.FullName }
+        } catch {}
+    }
+
+    # Full fixed-drive walk. The exclusions are leaf directory names only,
+    # so C:\PHP and user AppData/WinGet paths remain in scope.
     if (-not $NoFileSystemScan) {
         foreach ($root in $Roots) {
             if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
@@ -65,8 +95,7 @@ function Find-PHPFiles {
                                 if ($excludedDirectoryNames -notcontains $leaf) { $stack.Push($item) }
                             }
                             elseif ($targetNames -contains [IO.Path]::GetFileName($item)) {
-                                $fi = Get-Item -LiteralPath $item -Force
-                                if ($fi) { $found[$fi.FullName] = $fi }
+                                Add-PHPFile $item
                             }
                         } catch {}
                     }
@@ -74,7 +103,9 @@ function Find-PHPFiles {
             }
         }
     }
-    return $found.Values
+
+    # Unary comma prevents PowerShell from unexpectedly reshaping an empty/single result.
+    return $results.ToArray()
 }
 
 function ConvertTo-Version([string]$Text) {

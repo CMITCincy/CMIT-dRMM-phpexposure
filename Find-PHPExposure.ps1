@@ -3,8 +3,7 @@ param(
     [string[]]$ScanRoots,
     [string]$CsvPath,
     [string]$JsonPath,
-    [switch]$EnableRuntimeVersionProbe,
-    [switch]$NoFileSystemScan
+    [switch]$EnableRuntimeVersionProbe
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -15,7 +14,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $excludedDirectoryNames = @(
     '$Recycle.Bin','System Volume Information','WinSxS','SoftwareDistribution',
-    'Windows.old','Recovery','MSOCache','Config.Msi'
+    'Recovery'
 )
 $targetNames = @('php.exe','php-cgi.exe','php-win.exe')
 $fixedBuilds = @{
@@ -33,16 +32,13 @@ function Get-NormalizedPath([string]$Path) {
 function Find-PHPFiles {
     param([string[]]$Roots)
 
-    # Use a HashSet for de-duplication and emit FileInfo objects directly.
-    # This avoids relying on Dictionary.Values pipeline enumeration.
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $results = [Collections.Generic.List[IO.FileInfo]]::new()
 
     function Add-PHPFile([string]$Path) {
         try {
             if (-not $Path) { return }
-            $leaf = [IO.Path]::GetFileName($Path)
-            if ($targetNames -notcontains $leaf) { return }
+            if ($targetNames -notcontains [IO.Path]::GetFileName($Path)) { return }
             $full = [IO.Path]::GetFullPath($Path)
             if ($seen.Add($full)) {
                 $fi = Get-Item -LiteralPath $full -Force -ErrorAction Stop
@@ -51,60 +47,37 @@ function Find-PHPFiles {
         } catch {}
     }
 
-    # Fast checks for normal standalone/dev installs.
-    $quickRoots = @(
-        "$env:SystemDrive\PHP",
-        "$env:SystemDrive\xampp\php",
-        "$env:SystemDrive\laragon\bin\php",
-        "$env:SystemDrive\wamp64\bin\php",
-        "$env:SystemDrive\wamp\bin\php",
-        "$env:ProgramFiles\PHP",
-        "${env:ProgramFiles(x86)}\PHP"
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
+    # Scan every directory on every selected fixed drive. Only the explicit
+    # blocklist and reparse points are skipped. Access failures affect only
+    # that individual directory or file and do not stop the wider scan.
+    foreach ($root in $Roots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        $stack = [Collections.Generic.Stack[string]]::new()
+        $stack.Push((Get-NormalizedPath $root))
 
-    # Explicitly add every local user WinGet package directory. This catches
-    # packages such as PHP.PHP.8.2_Microsoft.Winget.Source_8wekyb3d8bbwe.
-    $userRoots = @(Get-ChildItem -LiteralPath "$env:SystemDrive\Users" -Directory -Force -ErrorAction SilentlyContinue |
-        ForEach-Object { Join-Path $_.FullName 'AppData\Local\Microsoft\WinGet\Packages' } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+        while ($stack.Count -gt 0) {
+            $dir = $stack.Pop()
+            try {
+                foreach ($item in [IO.Directory]::EnumerateFileSystemEntries($dir)) {
+                    try {
+                        $attr = [IO.File]::GetAttributes($item)
+                        if (($attr -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
 
-    foreach ($scan in @($quickRoots + $userRoots)) {
-        try {
-            Get-ChildItem -LiteralPath $scan -File -Recurse -Force -ErrorAction SilentlyContinue |
-                Where-Object { $targetNames -contains $_.Name } |
-                ForEach-Object { Add-PHPFile $_.FullName }
-        } catch {}
-    }
-
-    # Full fixed-drive walk. The exclusions are leaf directory names only,
-    # so C:\PHP and user AppData/WinGet paths remain in scope.
-    if (-not $NoFileSystemScan) {
-        foreach ($root in $Roots) {
-            if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-            $stack = [Collections.Generic.Stack[string]]::new()
-            $stack.Push((Get-NormalizedPath $root))
-            while ($stack.Count -gt 0) {
-                $dir = $stack.Pop()
-                try {
-                    foreach ($item in [IO.Directory]::EnumerateFileSystemEntries($dir)) {
-                        try {
-                            $attr = [IO.File]::GetAttributes($item)
-                            if (($attr -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-                            if (($attr -band [IO.FileAttributes]::Directory) -ne 0) {
-                                $leaf = [IO.Path]::GetFileName($item)
-                                if ($excludedDirectoryNames -notcontains $leaf) { $stack.Push($item) }
+                        if (($attr -band [IO.FileAttributes]::Directory) -ne 0) {
+                            $leaf = [IO.Path]::GetFileName($item)
+                            if ($excludedDirectoryNames -notcontains $leaf) {
+                                $stack.Push($item)
                             }
-                            elseif ($targetNames -contains [IO.Path]::GetFileName($item)) {
-                                Add-PHPFile $item
-                            }
-                        } catch {}
-                    }
-                } catch {}
-            }
+                        }
+                        elseif ($targetNames -contains [IO.Path]::GetFileName($item)) {
+                            Add-PHPFile $item
+                        }
+                    } catch {}
+                }
+            } catch {}
         }
     }
 
-    # Unary comma prevents PowerShell from unexpectedly reshaping an empty/single result.
     return $results.ToArray()
 }
 
